@@ -21,7 +21,6 @@ import {
   EMI_STATUS,
 } from '../constants/index.js';
 import { DELINQUENCY_BUCKETS, round2 } from '../utils/emi.js';
-import { refreshAllDelinquency, refreshBorrowerDelinquency } from './loanService.js';
 import { getNextDue } from './paymentService.js';
 import { getRecentActivity } from './auditService.js';
 
@@ -39,10 +38,17 @@ async function countBy(Model, field, match = {}, keys = []) {
   return result;
 }
 
-/** Admin KPIs, ageing, trends and the recent activity feed. */
+/**
+ * Admin KPIs, ageing, trends and the recent activity feed.
+ *
+ * Read-only on purpose. This used to run a full delinquency sweep first, which
+ * cost roughly 600ms per live loan — the dashboard paid for ageing the entire
+ * portfolio, serially, before computing a single number. Nothing is lost by
+ * dropping it: delinquency is refreshed whenever a payment posts, whenever a
+ * loan is opened, and on the timer in server.js (every 15 minutes by default),
+ * and DPD itself only changes at a day boundary.
+ */
 export async function getAdminDashboard() {
-  await refreshAllDelinquency();
-
   const statusKeys = Object.values(APPLICATION_STATUS);
 
   const [
@@ -172,9 +178,8 @@ export async function getAdminDashboard() {
 
 /** Customer dashboard: application stepper state, active loan, next EMI, ledger. */
 export async function getCustomerDashboard(userId) {
-  // Only this borrower's loans — see refreshBorrowerDelinquency.
-  await refreshBorrowerDelinquency(userId);
-
+  // Read-only, for the same reason as the admin dashboard above: this borrower's
+  // loans are aged on payment, on loan open, and by the scheduled sweep.
   const [applications, loans, payments] = await Promise.all([
     LoanApplication.find({ applicant: userId }).sort({ createdAt: -1 }).limit(5).lean(),
     LoanAccount.find({ borrower: userId }).sort({ createdAt: -1 }).lean(),

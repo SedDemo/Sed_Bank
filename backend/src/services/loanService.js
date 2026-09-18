@@ -36,6 +36,7 @@ import { getPolicy } from './configService.js';
 import { recordAudit } from './auditService.js';
 import { notifyUser, notifyStaff } from './notificationService.js';
 import { emitToStaff, emitToUser, broadcastDataChange } from '../realtime/socket.js';
+import logger from '../utils/logger.js';
 
 /* ------------------------------------------------------------------ */
 /* Ledger derivation                                                   */
@@ -361,10 +362,11 @@ export async function refreshLoanDelinquency(loan, { policy = null, asOf = new D
 /**
  * Ages just one borrower's live loans.
  *
- * A borrower's dashboard shows their own loans, so sweeping the whole book to
- * render it is work proportional to every other customer's data — it was
- * taking 20s against ~15 loans and would grow linearly. The global sweep
- * still runs on boot and on the timer, so nothing goes stale.
+ * Written to keep the customer dashboard off the global sweep, which was taking
+ * 20s against ~15 loans. The dashboard no longer refreshes on read at all — the
+ * scheduled sweep and the payment path keep the figures current — so this now
+ * has no callers. Kept as the targeted alternative to a full sweep for anything
+ * that needs one borrower aged on demand.
  */
 export async function refreshBorrowerDelinquency(userId, { asOf = new Date() } = {}) {
   const policy = await getPolicy();
@@ -389,26 +391,112 @@ export async function refreshBorrowerDelinquency(userId, { asOf = new Date() } =
 }
 
 /**
- * Sweeps every live loan. Runs on boot, on a timer, and lazily before any
- * collections/dashboard read so ageing figures are never stale.
+ * Sweeps every live loan. Runs on boot and on the timer in server.js.
+ *
+ * Deliberately NOT called from any read path. Doing so cost about 600ms per
+ * live loan, serially, before a dashboard could render a single figure.
+ *
+ * Three things keep it cheap regardless of portfolio size:
+ *
+ *  - loans already aged today are skipped, since DPD is a function of the date
+ *    and cannot change again until tomorrow (pass `force` to override);
+ *  - every schedule is fetched in ONE query rather than one per loan, which is
+ *    what made the old version scale linearly in round trips;
+ *  - writes go through bulkWrite, and only for rows that actually changed.
  */
-export async function refreshAllDelinquency({ asOf = new Date() } = {}) {
+export async function refreshAllDelinquency({ asOf = new Date(), force = false } = {}) {
   const policy = await getPolicy();
-  const loans = await LoanAccount.find({ status: { $in: LIVE_LOAN_STATUSES } });
+  const { product } = policy;
 
-  let updated = 0;
-  const newlyOverdue = [];
-
-  for (const loan of loans) {
-    // eslint-disable-next-line no-await-in-loop -- sequential keeps free-tier memory flat
-    const result = await refreshLoanDelinquency(loan, { policy, asOf });
-    if (result.changed) updated += 1;
-    if (result.bucketChanged && loan.bucket !== 'current') newlyOverdue.push(loan);
+  const startOfToday = dayjs(asOf).startOf('day').toDate();
+  const query = { status: { $in: LIVE_LOAN_STATUSES } };
+  if (!force) {
+    // Never swept, or last swept before today.
+    query.$or = [{ lastSweepAt: { $exists: false } }, { lastSweepAt: null }, { lastSweepAt: { $lt: startOfToday } }];
   }
 
+  const loans = await LoanAccount.find(query);
+  if (loans.length === 0) return { scanned: 0, updated: 0, skipped: true };
+
+  // One query for every schedule, then group in memory.
+  const schedules = await EMISchedule.find({ loanAccount: { $in: loans.map((l) => l._id) } }).sort({
+    installmentNo: 1,
+  });
+  const byLoan = new Map();
+  for (const emi of schedules) {
+    const key = String(emi.loanAccount);
+    if (!byLoan.has(key)) byLoan.set(key, []);
+    byLoan.get(key).push(emi);
+  }
+
+  const emiOps = [];
+  const loanOps = [];
+  const newlyOverdue = [];
+  let updated = 0;
+
+  for (const loan of loans) {
+    const schedule = byLoan.get(String(loan._id)) ?? [];
+    let touched = 0;
+
+    for (const emi of schedule) {
+      if ([EMI_STATUS.PAID, EMI_STATUS.WAIVED].includes(emi.status)) continue;
+
+      const dpd = daysPastDue(emi.dueDate, asOf);
+      if (dpd <= 0) continue;
+
+      emi.dpd = dpd;
+      emi.status = EMI_STATUS.OVERDUE;
+
+      const set = { dpd, status: EMI_STATUS.OVERDUE };
+      // The late fee is charged once, the first time the installment ages.
+      if (!emi.penaltyAppliedAt && product.latePenaltyPct > 0) {
+        emi.penalty = round2((emi.totalAmount * product.latePenaltyPct) / 100);
+        emi.penaltyAppliedAt = new Date();
+        set.penalty = emi.penalty;
+        set.penaltyAppliedAt = emi.penaltyAppliedAt;
+      }
+
+      emiOps.push({ updateOne: { filter: { _id: emi._id }, update: { $set: set } } });
+      touched += 1;
+    }
+
+    const previousBucket = loan.bucket;
+    applyTotals(loan, schedule);
+    loan.lastSweepAt = new Date();
+
+    loanOps.push({
+      updateOne: {
+        filter: { _id: loan._id },
+        update: {
+          $set: {
+            principalOutstanding: loan.principalOutstanding,
+            principalPaid: loan.principalPaid,
+            interestPaid: loan.interestPaid,
+            penaltyAccrued: loan.penaltyAccrued,
+            penaltyPaid: loan.penaltyPaid,
+            totalPaid: loan.totalPaid,
+            overdueAmount: loan.overdueAmount,
+            overdueEmiCount: loan.overdueEmiCount,
+            dpd: loan.dpd,
+            bucket: loan.bucket,
+            status: loan.status,
+            lastSweepAt: loan.lastSweepAt,
+          },
+        },
+      },
+    });
+
+    if (touched > 0) updated += 1;
+    if (previousBucket !== loan.bucket && loan.bucket !== 'current') newlyOverdue.push(loan);
+  }
+
+  if (emiOps.length) await EMISchedule.bulkWrite(emiOps, { ordered: false });
+  if (loanOps.length) await LoanAccount.bulkWrite(loanOps, { ordered: false });
+
+  // Fire-and-forget: notifyUser sends mail, and a slow SMTP hop must not hold
+  // up the sweep (or, when triggered manually, the HTTP response behind it).
   for (const loan of newlyOverdue) {
-    // eslint-disable-next-line no-await-in-loop
-    await notifyUser({
+    notifyUser({
       userId: loan.borrower,
       title: 'EMI payment overdue',
       message: `Loan ${loan.loanNo} has ₹${loan.overdueAmount.toLocaleString('en-IN')} overdue (${loan.dpd} days). A late fee has been applied.`,
@@ -416,7 +504,7 @@ export async function refreshAllDelinquency({ asOf = new Date() } = {}) {
       category: 'collections',
       link: `/app/loans/${loan._id}`,
       alsoEmail: true,
-    });
+    }).catch((error) => logger.error(`Overdue notification failed: ${error.message}`));
   }
 
   if (updated) broadcastDataChange(['loans', 'collections', 'dashboard']);

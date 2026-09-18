@@ -11,15 +11,13 @@ import EMISchedule from '../models/EMISchedule.js';
 import ApiError from '../utils/ApiError.js';
 import { LIVE_LOAN_STATUSES, EMI_STATUS } from '../constants/index.js';
 import { DELINQUENCY_BUCKETS, round2 } from '../utils/emi.js';
-import { refreshAllDelinquency } from './loanService.js';
 import { recordAudit } from './auditService.js';
 import { notifyUser } from './notificationService.js';
 import { broadcastDataChange } from '../realtime/socket.js';
 
 /** Portfolio ageing summary — one row per bucket, plus portfolio totals. */
 export async function getOverview() {
-  await refreshAllDelinquency();
-
+  // Read-only — the scheduled sweep and the write paths keep ageing current.
   const grouped = await LoanAccount.aggregate([
     { $match: { status: { $in: LIVE_LOAN_STATUSES } } },
     {
@@ -64,8 +62,7 @@ export async function getOverview() {
 
 /** Delinquent account worklist, optionally narrowed to one ageing bucket. */
 export async function listDelinquentAccounts({ bucket = 'all', search = '', page = 1, limit = 20 }) {
-  await refreshAllDelinquency();
-
+  // Read-only — see getOverview above.
   const query = { status: { $in: LIVE_LOAN_STATUSES } };
 
   if (bucket && bucket !== 'all') query.bucket = bucket;
